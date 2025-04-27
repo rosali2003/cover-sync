@@ -10,9 +10,12 @@ import {
 import { TextContent } from "pdfjs-dist/types/src/display/api";
 import * as pdfjsLib from "pdfjs-dist";
 import { truncateWords } from "../utils/truncate";
+import { PdfReader } from "@/app/api/lib/utils/resumeReader";
 
 // Initialize PDF.js worker
-pdfjsLib.GlobalWorkerOptions.workerSrc = `//cdnjs.cloudflare.com/ajax/libs/pdf.js/${pdfjsLib.version}/pdf.worker.min.js`;
+if (typeof window !== "undefined") {
+  pdfjsLib.GlobalWorkerOptions.workerSrc = "/pdfjs/pdf.worker.min.mjs";
+}
 
 interface ResumeUploaderProps {
   onResumeProcessed: (text: string) => void;
@@ -41,23 +44,17 @@ export const ResumeUploader = ({ onResumeProcessed }: ResumeUploaderProps) => {
 
   const handlePdfParse = async (pdfFile: File) => {
     setIsProcessing(true);
-    console.log("Is processing", isProcessing);
     setStatus("Processing PDF...");
 
     try {
+      // Convert File to Buffer
       const arrayBuffer = await pdfFile.arrayBuffer();
-      const pdf = await pdfjsLib.getDocument({ data: arrayBuffer }).promise;
-      let fullText = "";
+      const buffer = Buffer.from(arrayBuffer);
 
-      // Extract text from each page
-      for (let i = 1; i <= pdf.numPages; i++) {
-        const page = await pdf.getPage(i);
-        const textContent = (await page.getTextContent()) as TextContent;
-        const pageText = textContent.items
-          .map((item) => ("str" in item ? item.str : ""))
-          .join(" ");
-        fullText += pageText + "\n";
-      }
+      // Use PdfReader to extract text
+      const pdfReader = new PdfReader();
+      const fullText = await pdfReader.extractText(buffer);
+      console.log("Full text:", fullText);
 
       // Truncate the text
       const truncatedText = truncateWords(fullText, 4000);

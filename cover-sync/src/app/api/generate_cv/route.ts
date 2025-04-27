@@ -2,27 +2,46 @@ import { NextResponse } from "next/server";
 import { GoogleGenerativeAI } from "@google/generative-ai";
 import { fetchPageContent } from "../lib/utils/pageParser";
 import { crawlPage } from "../lib/utils/crawler";
+import { GoogleCustomSearch } from "../lib/utils/googleSearch";
+import { RagProcessor } from "../lib/utils/ragProcessor";
 
 // Initialize Gemini
 const genAI = new GoogleGenerativeAI(process.env.GOOGLE_API_KEY || "");
 const model = genAI.getGenerativeModel({ model: "gemini-2.0-flash-exp" });
 
 function ensureValidUrl(urlString: string): URL {
-  if (!urlString.startsWith("http://") && !urlString.startsWith("https://")) {
-    return new URL(`https://${urlString}`);
+  // Clean up the URL string
+  let cleanedUrl = urlString.trim();
+
+  // Remove any duplicate protocol prefixes
+  cleanedUrl = cleanedUrl.replace(/^(https?:\/\/)+/, "https://");
+
+  // If no protocol is present, add https://
+  if (!cleanedUrl.startsWith("http://") && !cleanedUrl.startsWith("https://")) {
+    cleanedUrl = `https://${cleanedUrl}`;
   }
-  return new URL(urlString);
+
+  try {
+    return new URL(cleanedUrl);
+  } catch (error) {
+    console.error("Invalid URL:", cleanedUrl);
+    throw new Error("Invalid URL provided");
+  }
 }
 
 interface PageContents {
   [key: string]: string;
 }
 
-async function analyzeContent(content: string) {
+async function analyzeContent(content: string, searchContext?: string) {
   try {
+    const contextPrompt = searchContext
+      ? `Additional context from web search:\n${searchContext}\n\n`
+      : "";
+
     const prompt = `You are a professional career advisor. Analyze this company page content and extract key information for a cover letter.
 
-    Analyze this content and extract:
+    ${contextPrompt}Analyze this content and extract:
     1) Company values and culture
     2) Key requirements and qualifications
     3) Responsibilities and expectations
@@ -31,7 +50,6 @@ async function analyzeContent(content: string) {
 
     const result = await model.generateContent(prompt);
     const response = await result.response;
-    console.log("Gemini response:", response.text());
     return response.text();
   } catch (error) {
     console.error("Gemini API error:", error);
@@ -39,18 +57,26 @@ async function analyzeContent(content: string) {
   }
 }
 
-async function generateCoverLetter(companyInfo: string, jobInfo: string, candidateInfo: string) {
+async function generateCoverLetter(
+  companyInfo: string,
+  jobInfo: string,
+  candidateInfo: string,
+  searchContext?: string
+) {
   try {
+    const contextPrompt = searchContext
+      ? `Additional company research:\n${searchContext}\n\n`
+      : "";
+
     const prompt = `You are a professional cover letter writer. Create a compelling cover letter based on this information:
 
-    Company Information: ${companyInfo}
+    ${contextPrompt}Company Information: ${companyInfo}
     Job Information: ${jobInfo}
     Candidate Information: ${candidateInfo}
     Format the cover letter professionally with proper spacing and paragraphs.`;
 
     const result = await model.generateContent(prompt);
     const response = await result.response;
-    console.log("Generated cover letter:", response.text());
     return response.text();
   } catch (error) {
     console.error("Gemini API error:", error);
@@ -96,19 +122,39 @@ export async function POST(request: Request) {
     console.log("resume text", resumeText);
     console.log("url", company_applying_for);
     const url = ensureValidUrl(company_applying_for);
+
+    // Initialize RAG components
+    const searchClient = new GoogleCustomSearch();
+    const ragProcessor = new RagProcessor();
+
+    // Perform company research using RAG
+    const companySearchQuery = `${url.hostname} company culture values mission`;
+    const searchResults = await searchClient.search(companySearchQuery);
+    const processedContext = await ragProcessor.processSearchResults(
+      searchResults
+    );
+
     const paths = await foundPaths(url);
     const pageContents: PageContents = {};
 
     if (paths) {
       for (const path of paths) {
-        const fullUrl = new URL(path, company_applying_for).toString();
-        const content = await fetchPageContent(fullUrl);
-        if (content) {
-          pageContents[path] = content;
+        try {
+          // Handle both absolute and relative paths
+          const fullUrl = path.startsWith("http")
+            ? path
+            : new URL(path, url.origin).toString();
+          const content = await fetchPageContent(fullUrl);
+          if (content) {
+            pageContents[path] = content;
+          }
+        } catch (error) {
+          console.error(`Error processing path ${path}:`, error);
+          continue;
         }
       }
     }
-    console.log('paths', paths)
+    console.log("paths", paths);
     const aboutPath = paths?.find((path) =>
       path.toLowerCase().includes("about")
     );
@@ -117,10 +163,10 @@ export async function POST(request: Request) {
     );
 
     const aboutAnalysis = aboutPath
-      ? await analyzeContent(pageContents[aboutPath])
+      ? await analyzeContent(pageContents[aboutPath], processedContext)
       : null;
     const careersAnalysis = careersPath
-      ? await analyzeContent(pageContents[careersPath])
+      ? await analyzeContent(pageContents[careersPath], processedContext)
       : null;
 
     const candidateAnalysis = await analyzeContent(resumeText);
@@ -134,7 +180,8 @@ export async function POST(request: Request) {
       coverLetter = await generateCoverLetter(
         aboutAnalysis,
         careersAnalysis,
-        candidateAnalysis ?? ""
+        candidateAnalysis ?? "",
+        processedContext
       );
       console.log("cover letter", coverLetter);
     }
@@ -145,11 +192,12 @@ export async function POST(request: Request) {
         about: aboutAnalysis,
         careers: careersAnalysis,
         candidate: candidateAnalysis,
+        searchContext: processedContext,
       },
       body: coverLetter,
     });
   } catch (error) {
-    console.log("error", error);
+    console.error("Error:", error);
     return NextResponse.json(
       {
         success: false,
